@@ -26,6 +26,8 @@
 #include <string.h>
 #include <math.h>
 #include "pico/stdlib.h"
+#include "pico/multicore.h" // Required for multicore functions
+#include "pico/sync.h"      // Required for spinlocks
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
@@ -77,6 +79,8 @@ typedef signed int fix15 ;
 // DAC Control Bits (A-channel, 1x gain, active / B-channel, 1x gain, active)
 #define DAC_config_chan_A 0b0011000000000000
 #define DAC_config_chan_B 0b1011000000000000
+#define SPI_LOCK_NUM 0 // Spinlock number for SPI protection
+spin_lock_t *spi_lock ; // Pointer to spinlock instance
 
 // === Audio Synthesis (DDS) Config ===
 #define two32 4294967296.0  // 2^32
@@ -84,8 +88,25 @@ typedef signed int fix15 ;
 #define DELAY 20 // ISR interval = 1/Fs = 20 microseconds
 #define sine_table_size 256
 fix15 sin_table[sine_table_size] ;
+
+// === DDS Synthesis - Core 0 (Channel B - variable amplitude) ===
 volatile unsigned int phase_accum_main_0;
 volatile unsigned int phase_incr_main_0 = (400.0*two32)/Fs ; // 400 Hz beep
+volatile fix15 current_amplitude_0 = 0 ; // Current amplitude envelope (modified in ISR 0)
+volatile fix15 distance_amplitude_scale = int2fix15(1); // Scale factor from distance (updated by protothread)
+volatile unsigned int STATE_0 = 0 ;      // 0: Beeping, 1: Silent Interval
+volatile unsigned int count_0 = 0 ;      // Counter for timing within states
+uint16_t DAC_data_0 ;                    // Value sent to SPI (channel B)
+volatile int DAC_output_0 ;              // Intermediate DAC value (channel B)
+
+// === DDS Synthesis - Core 1 (Channel A - fixed amplitude envelope) ===
+volatile unsigned int phase_accum_main_1;
+volatile unsigned int phase_incr_main_1 = (800.0*two32)/Fs ; // 800 Hz beep
+volatile fix15 current_amplitude_1 = 0 ; // Current amplitude envelope (modified in ISR 1)
+volatile unsigned int STATE_1 = 0 ;      // 0: Beeping, 1: Silent Interval
+volatile unsigned int count_1 = 0 ;      // Counter for timing within states
+uint16_t DAC_data_1 ;                    // Value sent to SPI (channel A)
+volatile int DAC_output_1 ;              // Intermediate DAC value (channel A)
 
 // === Beep Envelope Timing === (in units of ISR ticks)
 #define ATTACK_TIME             250
@@ -97,25 +118,18 @@ volatile unsigned int phase_incr_main_0 = (400.0*two32)/Fs ; // 400 Hz beep
 fix15 max_amplitude = int2fix15(1) ; // Maximum possible amplitude envelope
 fix15 attack_inc ;                   // Rate sound ramps up (calculated in main)
 fix15 decay_inc ;                    // Rate sound ramps down (calculated in main)
-volatile fix15 current_amplitude_0 = 0 ; // Current amplitude envelope (modified in ISR)
-volatile fix15 distance_amplitude_scale = int2fix15(1); // Scale factor from distance (updated by protothread)
-
-// === Beep State Machine (ISR) ===
-volatile unsigned int STATE_0 = 0 ; // 0: Beeping, 1: Silent Interval
-volatile unsigned int count_0 = 0 ; // Counter for timing within states
-
-// === DAC output variable ===
-uint16_t DAC_data_0 ; // Value sent to SPI
-volatile int DAC_output_0 ; // DAC output value before masking (accessed in ISR)
 
 // === Distance to Amplitude Mapping ===
 #define MIN_DIST_VOL 20  // Distance (cm) for max volume
 #define MAX_DIST_VOL 200 // Distance (cm) for min volume (zero)
 
-// === Timer Alarm for ISR ===
-#define ALARM_NUM 0
-#define ALARM_IRQ TIMER_IRQ_0
-#define ISR_GPIO 15 // GPIO to toggle in ISR for timing checks (optional)
+// === Timer Alarms for ISRs ===
+#define ALARM_NUM_0 0
+#define ALARM_NUM_1 1
+#define ALARM_IRQ_0 TIMER_IRQ_0
+#define ALARM_IRQ_1 TIMER_IRQ_1
+#define ISR_GPIO_0 15 // GPIO for Core 0 ISR timing (optional)
+#define ISR_GPIO_1 16 // GPIO for Core 1 ISR timing (optional)
 
 // === Lidar/Angle Mapping ===
 #define ANGLE_BUCKETS 37 // 0 to 180 degrees in 5-degree steps (180/5 + 1)
@@ -130,7 +144,9 @@ uint64_t last_min_print_time_us = 0; // For timed printing in protothread
 // === Function Prototypes (declare before use) ===
 int16_t getLidarData(uart_inst_t *uart_id);
 float map_value(uint16_t value, uint16_t in_min, uint16_t in_max, float out_min, float out_max);
-static void alarm_irq(void);
+static void alarm_irq_0(void);
+static void alarm_irq_1(void);
+void core1_entry();
 
 // ==================================================
 // === Lidar Data Acquisition Function ===
@@ -175,17 +191,17 @@ float map_value(uint16_t value, uint16_t in_min, uint16_t in_max, float out_min,
 
 
 // ==================================================
-// === Timer ISR (Core 0) ===
+// === Timer ISR Core 0 (Channel B - variable vol) ===
 // ==================================================
 // This is called at Fs (e.g., 50kHz)
-static void alarm_irq(void) {
+static void alarm_irq_0(void) {
     // Assert GPIO for timing check (optional)
-    gpio_put(ISR_GPIO, 1) ;
+    gpio_put(ISR_GPIO_0, 1) ;
 
     // Clear the alarm irq
-    hw_clear_bits(&timer_hw->intr, 1u << ALARM_NUM);
+    hw_clear_bits(&timer_hw->intr, 1u << ALARM_NUM_0);
     // Rearm the alarm
-    timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
+    timer_hw->alarm[ALARM_NUM_0] = timer_hw->timerawl + DELAY ;
 
     // === Beep State Machine ===
     if (STATE_0 == 0) { // State 0: Beeping
@@ -225,8 +241,10 @@ static void alarm_irq(void) {
         // Mask with DAC control bits (using channel B)
         DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xFFF)); // Ensure only 12 bits are used
 
-        // SPI write (non-blocking preferred in ISR if buffer available, but blocking is simpler here)
+        // SPI write with spinlock protection
+        spin_lock_unsafe_blocking(spi_lock) ;
         spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+        spin_unlock_unsafe(spi_lock) ;
 
         // Increment the counter for envelope timing
         count_0++;
@@ -238,7 +256,9 @@ static void alarm_irq(void) {
             current_amplitude_0 = 0; // Ensure silence
             // Optionally clear DAC output immediately
             DAC_data_0 = (DAC_config_chan_B | 2048); // Midpoint
+            spin_lock_unsafe_blocking(spi_lock) ;
             spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+            spin_unlock_unsafe(spi_lock) ;
         }
     }
     else { // State 1: Silent Interval
@@ -254,7 +274,94 @@ static void alarm_irq(void) {
     }
 
     // De-assert GPIO for timing check
-    gpio_put(ISR_GPIO, 0) ;
+    gpio_put(ISR_GPIO_0, 0) ;
+}
+
+// ==================================================
+// === Timer ISR Core 1 (Channel A - fixed vol) ===
+// ==================================================
+// This is called at Fs (e.g., 50kHz)
+static void alarm_irq_1(void) {
+    // Assert GPIO for timing check (optional)
+    gpio_put(ISR_GPIO_1, 1) ;
+
+    // Clear the alarm irq
+    hw_clear_bits(&timer_hw->intr, 1u << ALARM_NUM_1);
+    // Rearm the alarm
+    timer_hw->alarm[ALARM_NUM_1] = timer_hw->timerawl + DELAY ;
+
+    // === Beep State Machine ===
+    if (STATE_1 == 0) { // State 0: Beeping
+        // DDS phase calculation
+        phase_accum_main_1 += phase_incr_main_1;
+        // Calculate basic sine output scaled by envelope
+        int current_sample = fix2int15(multfix15(current_amplitude_1, sin_table[phase_accum_main_1 >> 24]));
+        
+        // Scale by distance factor
+        int final_sample = fix2int15(multfix15(distance_amplitude_scale, int2fix15(current_sample)));
+
+        // Add DC offset (DAC middle value)
+        DAC_output_1 = final_sample + 2048;
+
+        // Clamp output to 12-bit range (0-4095)
+        if (DAC_output_1 > 4095) DAC_output_1 = 4095;
+        else if (DAC_output_1 < 0) DAC_output_1 = 0;
+
+        // === Amplitude Envelope Update ===
+        // Ramp up amplitude during attack phase
+        if (count_1 < ATTACK_TIME) {
+            current_amplitude_1 += attack_inc;
+            // Clamp amplitude to max_amplitude (safety)
+            if (current_amplitude_1 > max_amplitude) current_amplitude_1 = max_amplitude;
+        }
+        // Ramp down amplitude during decay phase
+        else if (count_1 >= (BEEP_DURATION - DECAY_TIME)) {
+             // Ensure amplitude doesn't go negative
+            if (current_amplitude_1 > decay_inc) {
+                current_amplitude_1 -= decay_inc;
+            } else {
+                current_amplitude_1 = 0;
+            }
+        }
+        // Sustain phase: amplitude held (implicitly, no change here)
+
+        // Mask with DAC control bits (using channel A)
+        DAC_data_1 = (DAC_config_chan_A | (DAC_output_1 & 0xFFF)); // Ensure only 12 bits are used
+
+        // SPI write with spinlock protection
+        spin_lock_unsafe_blocking(spi_lock) ;
+        spi_write16_blocking(SPI_PORT, &DAC_data_1, 1) ;
+        spin_unlock_unsafe(spi_lock) ;
+
+        // Increment the counter for envelope timing
+        count_1++;
+
+        // Check for state transition: Beep finished?
+        if (count_1 >= BEEP_DURATION) {
+            STATE_1 = 1; // Transition to silent state
+            count_1 = 0; // Reset counter for silent interval
+            current_amplitude_1 = 0; // Ensure silence
+            // Optionally clear DAC output immediately
+            DAC_data_1 = (DAC_config_chan_A | 2048); // Midpoint
+            spin_lock_unsafe_blocking(spi_lock) ;
+            spi_write16_blocking(SPI_PORT, &DAC_data_1, 1) ;
+            spin_unlock_unsafe(spi_lock) ;
+        }
+    }
+    else { // State 1: Silent Interval
+        // Increment counter for silent interval timing
+        count_1++;
+
+        // Check for state transition: Silent interval finished?
+        if (count_1 >= BEEP_REPEAT_INTERVAL) {
+            STATE_1 = 0; // Transition back to beeping state
+            count_1 = 0; // Reset counter for beep duration
+            current_amplitude_1 = 0; // Start beep ramp-up from zero
+        }
+    }
+
+    // De-assert GPIO for timing check
+    gpio_put(ISR_GPIO_1, 0) ;
 }
 
 // ==================================================
@@ -343,6 +450,25 @@ static PT_THREAD (protothread_lidar_pot(struct pt *pt))
     PT_END(pt);
 }
 
+// ==================================================
+// === Core 1 Entry Point ===
+// ==================================================
+void core1_entry() {
+    // Setup Timer ISR for Core 1 (Alarm 1, handling Channel A)
+    printf("Core 1: Setting up Timer ISR 1...\n");
+    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM_1) ;
+    irq_set_exclusive_handler(ALARM_IRQ_1, alarm_irq_1) ;
+    irq_set_enabled(ALARM_IRQ_1, true) ;
+    timer_hw->alarm[ALARM_NUM_1] = timer_hw->timerawl + DELAY ;
+    printf("Core 1: Timer ISR 1 Enabled.\n");
+
+    // Core 1 does nothing else in this version, just runs the ISR.
+    // If you wanted Core 1 threads, you'd add pt_add_thread() here
+    // and pt_schedule_start;
+    while(1){
+        tight_loop_contents(); // Keeps Core 1 active
+    }
+}
 
 // ==================================================
 // === Core 0 Main Entry Point ===
@@ -350,7 +476,7 @@ static PT_THREAD (protothread_lidar_pot(struct pt *pt))
 int main() {
     // Initialize stdio for printf
     stdio_init_all();
-    printf("Lidar/Potentiometer Audio Feedback System Initializing...\n");
+    printf("Multicore Lidar/Potentiometer Audio Feedback System Initializing...\n");
 
     // === Initialize Hardware ===
 
@@ -371,7 +497,7 @@ int main() {
     gpio_set_function(UART0_RX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART1_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART1_RX_PIN, GPIO_FUNC_UART);
-    printf("UART Initialized.\n");
+    printf("Core 0: UART Initialized.\n");
 
     // --- SPI (DAC) ---
     spi_init(SPI_PORT, 20000000); // 20 MHz
@@ -384,18 +510,21 @@ int main() {
     gpio_set_dir(PIN_CS, GPIO_OUT); // Set CS as output
     gpio_put(PIN_CS, 1); // Deselect DAC initially
     gpio_set_function(PIN_CS, GPIO_FUNC_SPI); // Then set to SPI function
-    printf("SPI Initialized.\n");
+    printf("Core 0: SPI Initialized.\n");
 
     // --- DAC LDAC Pin ---
     gpio_init(LDAC) ;
     gpio_set_dir(LDAC, GPIO_OUT) ;
     gpio_put(LDAC, 0) ; // Hold LDAC low (simultaneous update)
-    printf("LDAC Initialized.\n");
+    printf("Core 0: LDAC Initialized.\n");
 
     // --- ISR Timing GPIO (Optional) ---
-    gpio_init(ISR_GPIO) ;
-    gpio_set_dir(ISR_GPIO, GPIO_OUT);
-    gpio_put(ISR_GPIO, 0) ;
+    gpio_init(ISR_GPIO_0) ;
+    gpio_set_dir(ISR_GPIO_0, GPIO_OUT);
+    gpio_put(ISR_GPIO_0, 0) ;
+    gpio_init(ISR_GPIO_1) ;
+    gpio_set_dir(ISR_GPIO_1, GPIO_OUT);
+    gpio_put(ISR_GPIO_1, 0) ;
 
     // === Initialize Synthesis Data ===
 
@@ -404,37 +533,42 @@ int main() {
         // Generates sine wave values from -2047 to +2047 (approx)
         sin_table[ii] = float2fix15(2047.0 * sin((float)ii * 2.0 * M_PI / (float)sine_table_size));
     }
-    printf("Sine Table Built.\n");
+    printf("Core 0: Sine Table Built.\n");
 
     // --- Amplitude Envelope Increments ---
     // Avoid division by zero if time is zero
     attack_inc = (ATTACK_TIME > 0) ? divfix(max_amplitude, int2fix15(ATTACK_TIME)) : max_amplitude;
     decay_inc = (DECAY_TIME > 0) ? divfix(max_amplitude, int2fix15(DECAY_TIME)) : max_amplitude;
-    printf("Envelope Increments Calculated.\n");
+    printf("Core 0: Envelope Increments Calculated.\n");
 
     // --- Angle-Distance Map ---
     for (int i = 0; i < ANGLE_BUCKETS; i++) {
         angle_distance_map[i] = UINT16_MAX; 
     }
-    printf("Angle-Distance Map Initialized.\n");
+    printf("Core 0: Angle-Distance Map Initialized.\n");
 
     // === Setup Timer ISR ===
-    printf("Setting up Timer ISR...\n");
-    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM) ;
-    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
-    irq_set_enabled(ALARM_IRQ, true) ;
+    printf("Core 0: Setting up Timer ISR...\n");
+    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM_0) ;
+    irq_set_exclusive_handler(ALARM_IRQ_0, alarm_irq_0) ;
+    irq_set_enabled(ALARM_IRQ_0, true) ;
     // Arm the first alarm
-    timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
-    printf("Timer ISR Enabled.\n");
+    timer_hw->alarm[ALARM_NUM_0] = timer_hw->timerawl + DELAY ;
+    printf("Core 0: Timer ISR Enabled.\n");
 
     // === Setup Protothreads ===
     pt_add_thread(protothread_lidar_pot);
-    printf("Protothread Added.\n");
+    printf("Core 0: Protothread Added.\n");
 
-    // Start the scheduler
-    printf("Starting Protothread Scheduler...\n");
-    gpio_put(LED, 1); // Turn on LED to indicate running
-    pt_schedule_start; // This function never returns (no parentheses needed)
+    // === Launch Core 1 ===
+    printf("Core 0: Launching Core 1...\n");
+    multicore_launch_core1(core1_entry);
+    sleep_ms(10); // Small delay to allow Core 1 to start up
+
+    // === Start Core 0 Scheduler ===
+    printf("Core 0: Starting Protothread Scheduler...\n");
+    gpio_put(LED, 1); 
+    pt_schedule_start; // This function never returns
 
     // Code below here will not run
     return 0;
