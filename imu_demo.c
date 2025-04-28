@@ -69,6 +69,9 @@ typedef signed int fix15 ;
 // === ADC Config ===
 #define POT_PIN 28
 
+// === Button Config ===
+#define BUTTON_PIN 14
+
 // === SPI/DAC Config ===
 #define PIN_MISO 4
 #define PIN_CS   13
@@ -108,6 +111,10 @@ volatile unsigned int count_1 = 0 ;      // Counter for timing within states
 uint16_t DAC_data_1 ;                    // Value sent to SPI (channel A)
 volatile int DAC_output_1 ;              // Intermediate DAC value (channel A)
 
+// === Interaural Time Difference (ITD) ===
+volatile int delay_ticks_0 = 0; // Delay ticks for Core 0 / Channel B (Right Ear)
+volatile int delay_ticks_1 = 0; // Delay ticks for Core 1 / Channel A (Left Ear)
+
 // === Beep Envelope Timing === (in units of ISR ticks)
 #define ATTACK_TIME             250
 #define DECAY_TIME              250
@@ -138,8 +145,17 @@ uint16_t min_distance = UINT16_MAX;
 float min_distance_angle = -1.0f;
 uint64_t last_min_print_time_us = 0; // For timed printing in protothread
 
+#define head_diameter 0.144
+#define v_sound 344
+
 // === LED ===
 #define LED 25 // Onboard LED
+
+/* FSM States */
+typedef enum {
+    STATE_SCANNING,
+    STATE_LOCKED
+} system_state_t;
 
 // === Function Prototypes (declare before use) ===
 int16_t getLidarData(uart_inst_t *uart_id);
@@ -241,10 +257,16 @@ static void alarm_irq_0(void) {
         // Mask with DAC control bits (using channel B)
         DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xFFF)); // Ensure only 12 bits are used
 
-        // SPI write with spinlock protection
-        spin_lock_unsafe_blocking(spi_lock) ;
-        spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
-        spin_unlock_unsafe(spi_lock) ;
+        // === SPI Write with ITD Delay ===
+        // If delay counter is active, decrement and skip SPI write
+        if (delay_ticks_0 > 0) {
+            delay_ticks_0--;
+        } else {
+            // Otherwise, write to DAC via SPI (with spinlock)
+            spin_lock_unsafe_blocking(spi_lock) ;
+            spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+            spin_unlock_unsafe(spi_lock) ;
+        }
 
         // Increment the counter for envelope timing
         count_0++;
@@ -328,10 +350,16 @@ static void alarm_irq_1(void) {
         // Mask with DAC control bits (using channel A)
         DAC_data_1 = (DAC_config_chan_A | (DAC_output_1 & 0xFFF)); // Ensure only 12 bits are used
 
-        // SPI write with spinlock protection
-        spin_lock_unsafe_blocking(spi_lock) ;
-        spi_write16_blocking(SPI_PORT, &DAC_data_1, 1) ;
-        spin_unlock_unsafe(spi_lock) ;
+        // === SPI Write with ITD Delay ===
+        // If delay counter is active, decrement and skip SPI write
+        if (delay_ticks_1 > 0) {
+            delay_ticks_1--;
+        } else {
+             // Otherwise, write to DAC via SPI (with spinlock)
+            spin_lock_unsafe_blocking(spi_lock) ;
+            spi_write16_blocking(SPI_PORT, &DAC_data_1, 1) ;
+            spin_unlock_unsafe(spi_lock) ;
+        }
 
         // Increment the counter for envelope timing
         count_1++;
@@ -365,88 +393,188 @@ static void alarm_irq_1(void) {
 }
 
 // ==================================================
-// === Protothread for Lidar/Potentiometer (Core 0) ===
+// === Protothread for Lidar/Pot/FSM (Core 0) ===
 // ==================================================
 static PT_THREAD (protothread_lidar_pot(struct pt *pt))
 {
     PT_BEGIN(pt);
 
-    static uint64_t last_print_time = 0; // Timing for 0.2 Hz print
+    // FSM state variable
+    static system_state_t current_state = STATE_SCANNING;
+    // Timer variables for printing
+    static uint64_t last_scan_print_time = 0; 
+    static uint64_t last_lock_print_time = 0;
+    // Variable to store calculated ITD for printing
+    static float last_itd_calc_ms = 0.0f;
+
+    printf("Protothread starting in SCANNING state.\n");
 
     while(1) {
+        // === Read Button State ===
+        // Simple check, assumes button pulls low when pressed
+        // Add debouncing here if needed
+        bool button_pressed = !gpio_get(BUTTON_PIN); 
+
         // === Read Potentiometer and Calculate Angle ===
         uint16_t pot_value = adc_read();
-        float angle = -1.0f; // Invalid angle initially
-
+        float angle = -1.0f; 
         if (pot_value >= 600 && pot_value <= 3500) {
             angle = map_value(pot_value, 600, 3500, 0.0f, 180.0f);
         }
-        // else: angle remains -1.0f (invalid)
 
         // === Read Lidar ===
         int16_t current_distance = getLidarData(UART1_ID);
 
-        // === Update Angle-Distance Map and Min Distance ===
-        if (angle >= 0.0f && current_distance >= 0) { // Check for valid angle and distance
-            // Calculate the index for the angle map (0-36)
-            int angle_index = (int)roundf(angle / 5.0f);
-            // Clamp index
-            if (angle_index < 0) angle_index = 0;
-            if (angle_index >= ANGLE_BUCKETS) angle_index = ANGLE_BUCKETS - 1;
+        // === FSM Logic ===
+        if (current_state == STATE_SCANNING) {
+            // --- Action: Update Map and Min Distance ---
+            if (angle >= 0.0f && current_distance >= 0) { 
+                int angle_index = (int)roundf(angle / 5.0f);
+                if (angle_index < 0) angle_index = 0;
+                if (angle_index >= ANGLE_BUCKETS) angle_index = ANGLE_BUCKETS - 1;
+                angle_distance_map[angle_index] = (uint16_t)current_distance;
 
-            // Store the distance in the map
-            angle_distance_map[angle_index] = (uint16_t)current_distance;
-
-            // Check for new overall minimum distance
-            if ((uint16_t)current_distance < min_distance) {
-                min_distance = (uint16_t)current_distance;
-                min_distance_angle = angle; // Store the precise angle
+                if ((uint16_t)current_distance < min_distance) {
+                    min_distance = (uint16_t)current_distance;
+                    min_distance_angle = angle; 
+                }
             }
-        }
-        
-        // === Update Audio Amplitude Scale based on Distance ===
-        if (current_distance >= 0) {
-            float dist_f = (float)current_distance;
-            float scale_f = 0.0f;
+            
+            // --- Action: Update Audio Scale based on CURRENT Distance ---
+            if (current_distance >= 0) {
+                float dist_f = (float)current_distance;
+                float scale_f = 0.0f;
+                if (dist_f < MIN_DIST_VOL) dist_f = MIN_DIST_VOL;
+                if (dist_f > MAX_DIST_VOL) dist_f = MAX_DIST_VOL;
+                scale_f = 1.0f - ((dist_f - MIN_DIST_VOL) / (MAX_DIST_VOL - MIN_DIST_VOL));
+                distance_amplitude_scale = float2fix15(scale_f);
+            } else {
+                distance_amplitude_scale = 0; // Mute on Lidar error
+            }
 
-            // Clamp distance to the defined volume range
-            if (dist_f < MIN_DIST_VOL) dist_f = MIN_DIST_VOL;
-            if (dist_f > MAX_DIST_VOL) dist_f = MAX_DIST_VOL;
+            // --- Action: Timed Printing ---
+            uint64_t current_time_us = PT_GET_TIME_usec();
+            if (current_time_us - last_scan_print_time >= 5000000) { // Print min every 5s
+                 if (min_distance != UINT16_MAX) {
+                     printf("[SCAN] Min Dist: %d cm at ~%.1f deg\n", min_distance, min_distance_angle);
+                 } else {
+                     printf("[SCAN] Min Dist: No minimum recorded yet\n");
+                 }
+                 last_scan_print_time = current_time_us; 
+            } else { // Print current reading otherwise
+                 if (angle >= 0.0f && current_distance >= 0) {
+                      printf("[SCAN] Angle:%.1f | Dist:%d | Scale:%.2f\n", angle, current_distance, fix2float15(distance_amplitude_scale));
+                 } 
+            }
 
-            // Calculate scale (inverse linear map: MIN_DIST -> 1.0, MAX_DIST -> 0.0)
-            scale_f = 1.0f - ((dist_f - MIN_DIST_VOL) / (MAX_DIST_VOL - MIN_DIST_VOL));
+            // --- State Transition ---
+            if (button_pressed) {
+                current_state = STATE_LOCKED;
+                printf("Button Pressed: Transitioning to LOCKED state.\n");
+                // Reset lock print timer when entering state
+                last_lock_print_time = PT_GET_TIME_usec(); 
+                // Optional: Set audio scale based on min_distance immediately
+                if (min_distance != UINT16_MAX) {
+                    float dist_f = (float)min_distance;
+                    // --- Calculate and Set ITD Delay --- 
+                    if (min_distance_angle >= 0.0f) { 
+                        // Convert pot angle (0-180) to ITD angle (-90 to +90)
+                        float theta_deg = min_distance_angle - 90.0f;
+                        float theta_rad = theta_deg * M_PI / 180.0f;
 
-            // Convert to fixed point and update the shared variable
-            distance_amplitude_scale = float2fix15(scale_f);
-        } else {
-            // Optional: What to do on failed Lidar read? Set volume to 0? Or keep previous?
-            // Let's set volume to 0 for safety/clarity on error.
-            distance_amplitude_scale = 0;
-        }
+                        // Calculate ITD
+                        float itd_seconds = (head_diameter / v_sound) * sinf(theta_rad);
+                        last_itd_calc_ms = itd_seconds * 1000.0f; // Store for printing
 
+                        // Calculate delay ticks (absolute value)
+                        int total_delay_ticks = (int)roundf(fabsf(itd_seconds) * Fs);
 
-        // === Timed Printing (0.2 Hz for min distance, otherwise current) ===
-        uint64_t current_time_us = PT_GET_TIME_usec();
-        // Check if 5 seconds (5,000,000 us) have passed for min distance print
-        if (current_time_us - last_print_time >= 5000000) {
+                        // Assign delay to the appropriate channel
+                        if (itd_seconds > 0.00001f) { // Sound arrives at Left ear first, delay Right (Core 0)
+                            delay_ticks_0 = total_delay_ticks;
+                            delay_ticks_1 = 0;
+                        } else if (itd_seconds < -0.00001f) { // Sound arrives at Right ear first, delay Left (Core 1)
+                            delay_ticks_1 = total_delay_ticks;
+                            delay_ticks_0 = 0;
+                        } else { // Directly ahead
+                            delay_ticks_0 = 0;
+                            delay_ticks_1 = 0;
+                        }
+                        printf("[LOCK] Angle: %.1f deg => ITD: %.3f ms => Delay L:%d R:%d ticks\n", 
+                               min_distance_angle, last_itd_calc_ms, delay_ticks_1, delay_ticks_0);
+                    } else {
+                        // No valid angle found during scan
+                        delay_ticks_0 = 0;
+                        delay_ticks_1 = 0;
+                         last_itd_calc_ms = 0.0f;
+                        printf("[LOCK] No valid angle for ITD calculation.\n");
+                    }
+                } else {
+                    distance_amplitude_scale = 0; // Mute if no min found
+                    delay_ticks_0 = 0; // No delay if muted
+                    delay_ticks_1 = 0;
+                    last_itd_calc_ms = 0.0f;
+                    printf("[LOCK] No minimum distance found, audio muted.\n");
+                }
+            }
+
+        } else if (current_state == STATE_LOCKED) {
+            // --- Action: Update Audio Scale based on RECORDED Min Distance ---
+            // (Recalculate each time in case min_distance was initially UINT16_MAX)
              if (min_distance != UINT16_MAX) {
-                 printf("--- Min Dist: %d cm at ~%.1f deg ---\n", min_distance, min_distance_angle);
-             } else {
-                 printf("--- Min Dist: No minimum recorded yet ---\n");
+                float dist_f = (float)min_distance; // Use the stored minimum
+                float scale_f = 0.0f;
+                if (dist_f < MIN_DIST_VOL) dist_f = MIN_DIST_VOL;
+                if (dist_f > MAX_DIST_VOL) dist_f = MAX_DIST_VOL;
+                scale_f = 1.0f - ((dist_f - MIN_DIST_VOL) / (MAX_DIST_VOL - MIN_DIST_VOL));
+                distance_amplitude_scale = float2fix15(scale_f);
+            } else {
+                distance_amplitude_scale = 0; // Keep muted if no min found
+            }
+            // NOTE: No map updates, no min distance updates in this state.
+
+            // --- Action: Periodic Printing of Min Distance ---
+             uint64_t current_time_us = PT_GET_TIME_usec();
+             if (current_time_us - last_lock_print_time >= 1000000) { // Print every 1 second (1Hz)
+                 if (min_distance != UINT16_MAX) {
+                     printf("[LOCKED] Closest: %d cm @ %.1f deg (ITD: %.3f ms)\n", 
+                            min_distance, min_distance_angle, last_itd_calc_ms);
+                 } else {
+                     printf("[LOCKED] No minimum distance recorded during scan.\n");
+                 }
+                 last_lock_print_time = current_time_us; 
              }
-             last_print_time = current_time_us; // Reset the timer
-        } else {
-             // Otherwise, print current reading if valid
-             if (angle >= 0.0f && current_distance >= 0) {
-                  printf("Angle: %.1f deg | Dist: %d cm | Vol Scale: %.2f\n", angle, current_distance, fix2float15(distance_amplitude_scale));
-             } else if (current_distance < 0) {
-                 // printf("Lidar read failed.\n");
-             } // Don't print if angle is invalid but lidar is ok
-        }
-        
-        // Yield execution for approx 20 ms
-        PT_YIELD_usec(20000);
-    }
+
+            // --- State Transition --- 
+            // Check if button is pressed again to return to scanning
+            if (button_pressed) {
+                current_state = STATE_SCANNING;
+                printf("Button Pressed: Returning to SCANNING state.\n");
+                printf("Resetting minimum distance and angle map.\n");
+
+                // Reset min distance tracking
+                min_distance = UINT16_MAX;
+                min_distance_angle = -1.0f;
+
+                // Reset the angle-distance map
+                for (int i = 0; i < ANGLE_BUCKETS; i++) {
+                    angle_distance_map[i] = UINT16_MAX; 
+                }
+                
+                // Reset ITD delays
+                delay_ticks_0 = 0;
+                delay_ticks_1 = 0;
+                last_itd_calc_ms = 0.0f;
+                
+                // Reset scan print timer when entering state
+                last_scan_print_time = PT_GET_TIME_usec(); 
+            }
+
+        } // End of FSM states
+
+        // Common yield for the protothread
+        PT_YIELD_usec(20000); // Yield for approx 20 ms
+    } // End while(1)
     PT_END(pt);
 }
 
@@ -474,102 +602,68 @@ void core1_entry() {
 // === Core 0 Main Entry Point ===
 // ==================================================
 int main() {
-    // Initialize stdio for printf
     stdio_init_all();
-    printf("Multicore Lidar/Potentiometer Audio Feedback System Initializing...\n");
+    printf("FSM Lidar/Potentiometer Audio Feedback System Initializing...\n");
 
     // === Initialize Hardware ===
-
-    // --- LED ---
-    gpio_init(LED) ;
-    gpio_set_dir(LED, GPIO_OUT) ;
-    gpio_put(LED, 0) ; // Start with LED off
-
-    // --- ADC (Potentiometer) ---
-    adc_init();
-    adc_gpio_init(POT_PIN);
-    adc_select_input(2); // ADC2 is GPIO28
-
-    // --- UART (Lidar and Debug) ---
-    uart_init(UART0_ID, BAUD_RATE); // For printf
-    uart_init(UART1_ID, BAUD_RATE); // For Lidar TF-Luna
-    gpio_set_function(UART0_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART0_RX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART1_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART1_RX_PIN, GPIO_FUNC_UART);
+    gpio_init(LED) ; gpio_set_dir(LED, GPIO_OUT) ; gpio_put(LED, 0) ;
+    adc_init(); adc_gpio_init(POT_PIN); adc_select_input(2); 
+    uart_init(UART0_ID, BAUD_RATE); uart_init(UART1_ID, BAUD_RATE); 
+    gpio_set_function(UART0_TX_PIN, GPIO_FUNC_UART); gpio_set_function(UART0_RX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART1_TX_PIN, GPIO_FUNC_UART); gpio_set_function(UART1_RX_PIN, GPIO_FUNC_UART);
     printf("Core 0: UART Initialized.\n");
+    
+    // --- Button ---
+    gpio_init(BUTTON_PIN);
+    gpio_set_dir(BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(BUTTON_PIN); // Enable pull-up, button press pulls low
+    printf("Core 0: Button GPIO Initialized (Pin %d).\n", BUTTON_PIN);
 
-    // --- SPI (DAC) ---
-    spi_init(SPI_PORT, 20000000); // 20 MHz
-    spi_set_format(SPI_PORT, 16, 0, 0, 0); // 16 bits, Mode 0
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-    // MISO not needed for DAC output, CS needs to be GPIO but controlled by SPI peripheral
-    // gpio_set_function(PIN_MISO, GPIO_FUNC_SPI); 
-    gpio_init(PIN_CS); // Initialize CS pin as GPIO
-    gpio_set_dir(PIN_CS, GPIO_OUT); // Set CS as output
-    gpio_put(PIN_CS, 1); // Deselect DAC initially
-    gpio_set_function(PIN_CS, GPIO_FUNC_SPI); // Then set to SPI function
+    spi_init(SPI_PORT, 20000000); 
+    spi_set_format(SPI_PORT, 16, 0, 0, 0); 
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI); gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_init(PIN_CS); gpio_set_dir(PIN_CS, GPIO_OUT); gpio_put(PIN_CS, 1); 
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI); 
     printf("Core 0: SPI Initialized.\n");
-
-    // --- DAC LDAC Pin ---
-    gpio_init(LDAC) ;
-    gpio_set_dir(LDAC, GPIO_OUT) ;
-    gpio_put(LDAC, 0) ; // Hold LDAC low (simultaneous update)
+    spi_lock = spin_lock_init(SPI_LOCK_NUM) ;
+    printf("Core 0: SPI Spinlock Initialized (Lock %d).\n", SPI_LOCK_NUM);
+    gpio_init(LDAC) ; gpio_set_dir(LDAC, GPIO_OUT) ; gpio_put(LDAC, 0) ;
     printf("Core 0: LDAC Initialized.\n");
-
-    // --- ISR Timing GPIO (Optional) ---
-    gpio_init(ISR_GPIO_0) ;
-    gpio_set_dir(ISR_GPIO_0, GPIO_OUT);
-    gpio_put(ISR_GPIO_0, 0) ;
-    gpio_init(ISR_GPIO_1) ;
-    gpio_set_dir(ISR_GPIO_1, GPIO_OUT);
-    gpio_put(ISR_GPIO_1, 0) ;
-
+    gpio_init(ISR_GPIO_0) ; gpio_set_dir(ISR_GPIO_0, GPIO_OUT); gpio_put(ISR_GPIO_0, 0) ;
+    gpio_init(ISR_GPIO_1) ; gpio_set_dir(ISR_GPIO_1, GPIO_OUT); gpio_put(ISR_GPIO_1, 0) ;
+    
     // === Initialize Synthesis Data ===
-
-    // --- Sine Table ---
     for (int ii = 0; ii < sine_table_size; ii++){
-        // Generates sine wave values from -2047 to +2047 (approx)
         sin_table[ii] = float2fix15(2047.0 * sin((float)ii * 2.0 * M_PI / (float)sine_table_size));
     }
     printf("Core 0: Sine Table Built.\n");
-
-    // --- Amplitude Envelope Increments ---
-    // Avoid division by zero if time is zero
     attack_inc = (ATTACK_TIME > 0) ? divfix(max_amplitude, int2fix15(ATTACK_TIME)) : max_amplitude;
     decay_inc = (DECAY_TIME > 0) ? divfix(max_amplitude, int2fix15(DECAY_TIME)) : max_amplitude;
     printf("Core 0: Envelope Increments Calculated.\n");
-
-    // --- Angle-Distance Map ---
-    for (int i = 0; i < ANGLE_BUCKETS; i++) {
-        angle_distance_map[i] = UINT16_MAX; 
-    }
+    for (int i = 0; i < ANGLE_BUCKETS; i++) { angle_distance_map[i] = UINT16_MAX; }
     printf("Core 0: Angle-Distance Map Initialized.\n");
-
-    // === Setup Timer ISR ===
-    printf("Core 0: Setting up Timer ISR...\n");
-    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM_0) ;
-    irq_set_exclusive_handler(ALARM_IRQ_0, alarm_irq_0) ;
-    irq_set_enabled(ALARM_IRQ_0, true) ;
-    // Arm the first alarm
-    timer_hw->alarm[ALARM_NUM_0] = timer_hw->timerawl + DELAY ;
-    printf("Core 0: Timer ISR Enabled.\n");
-
-    // === Setup Protothreads ===
-    pt_add_thread(protothread_lidar_pot);
-    printf("Core 0: Protothread Added.\n");
 
     // === Launch Core 1 ===
     printf("Core 0: Launching Core 1...\n");
     multicore_launch_core1(core1_entry);
     sleep_ms(10); // Small delay to allow Core 1 to start up
 
+    // === Setup Core 0 Timer ISR ===
+    printf("Core 0: Setting up Timer ISR 0...\n");
+    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM_0) ;
+    irq_set_exclusive_handler(ALARM_IRQ_0, alarm_irq_0) ;
+    irq_set_enabled(ALARM_IRQ_0, true) ;
+    timer_hw->alarm[ALARM_NUM_0] = timer_hw->timerawl + DELAY ;
+    printf("Core 0: Timer ISR 0 Enabled.\n");
+
+    // === Setup Core 0 Protothreads ===
+    pt_add_thread(protothread_lidar_pot);
+    printf("Core 0: Protothread Added.\n");
+
     // === Start Core 0 Scheduler ===
     printf("Core 0: Starting Protothread Scheduler...\n");
     gpio_put(LED, 1); 
     pt_schedule_start; // This function never returns
 
-    // Code below here will not run
-    return 0;
+    return 0; 
 }
